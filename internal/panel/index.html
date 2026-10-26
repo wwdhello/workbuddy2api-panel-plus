@@ -874,6 +874,28 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
       <div class="box">
         <header>
+          <h3>IP × 模型用量与缓存</h3>
+          <span class="grow"></span>
+          <span class="note" id="usIPModelNote">—</span>
+        </header>
+        <div class="tbl-wrap">
+          <table class="acc zebra">
+            <thead>
+              <tr>
+                <th class="mark" aria-hidden="true"></th>
+                <th>IP 来源</th><th>模型</th>
+                <th class="num">请求</th><th class="num">失败</th>
+                <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+                <th class="num">缓存命中</th><th class="num">缓存未命中</th><th class="num">命中率</th>
+              </tr>
+            </thead>
+            <tbody id="usIPModelBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
           <h3>积分扣除历史</h3>
           <span class="vtabs" id="usCreditTabs">
             <button data-dim="account" class="on">按账号</button>

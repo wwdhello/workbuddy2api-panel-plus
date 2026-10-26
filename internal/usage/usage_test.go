@@ -189,6 +189,9 @@ func TestSnapshotWindowFilter(t *testing.T) {
 	if len(s.Series) != 1 || s.Series[0].Scope != "hour" || s.Series[0].PromptTokens != 3 {
 		t.Fatalf("series = %+v, want 仅窗口内 1 个小时点", s.Series)
 	}
+	if len(s.ByIPModel) != 1 || s.ByIPModel[0].PromptTokens != 3 {
+		t.Fatalf("by_ip_model = %+v, want 窗口过滤同样作用于来源表", s.ByIPModel)
+	}
 	if s.Buckets != 1 {
 		t.Fatalf("buckets = %d, want 1（窗口内命中桶数）", s.Buckets)
 	}
@@ -351,5 +354,81 @@ func TestCacheTokensPersistRoundtrip(t *testing.T) {
 	snap := r2.Snapshot(0, nil)
 	if snap.CreditByModel[0].CacheHitRate != 75 {
 		t.Fatalf("恢复后 cache_hit_rate=%v want 75", snap.CreditByModel[0].CacheHitRate)
+	}
+}
+
+// IP × 模型维度必须分别聚合来源和模型，并正确计算缓存命中率；realm/账号不同
+// 不应拆开同一来源对同一模型的使用量。
+func TestIPModelAggregationAndCacheRate(t *testing.T) {
+	r := New("")
+	base := time.Date(2026, 10, 1, 10, 0, 0, 0, time.Local)
+	r.Add(base, "cn", "u1", "glm-5.3", Delta{
+		ClientIP: "203.0.113.7", PromptTokens: 100, HasPromptTokens: true,
+		HasCacheTokens: true, CacheHitTokens: 90, CacheMissTokens: 10,
+	}, true)
+	r.Add(base.Add(time.Minute), "global", "u2", "cn:glm-5.3", Delta{
+		ClientIP: "203.0.113.7", PromptTokens: 100, HasPromptTokens: true,
+		HasCacheTokens: true, CacheHitTokens: 10, CacheMissTokens: 90,
+	}, true)
+	r.Add(base.Add(2*time.Minute), "cn", "u1", "claude-4.6", Delta{
+		ClientIP: "203.0.113.7", PromptTokens: 20, HasPromptTokens: true,
+	}, true)
+	r.Add(base.Add(3*time.Minute), "cn", "u1", "glm-5.3", Delta{
+		ClientIP: "198.51.100.9", PromptTokens: 30, HasPromptTokens: true,
+		HasCacheTokens: true, CacheHitTokens: 24, CacheMissTokens: 6,
+	}, true)
+
+	s := r.Snapshot(0, nil)
+	if len(s.ByIPModel) != 3 {
+		t.Fatalf("by_ip_model rows=%+v, want 3", s.ByIPModel)
+	}
+	byKey := map[string]IPModelAgg{}
+	for _, row := range s.ByIPModel {
+		byKey[row.IP+"\x00"+row.Model] = row
+	}
+	glm := byKey["203.0.113.7\x00glm-5.3"]
+	if glm.Requests != 2 || glm.PromptTokens != 200 || glm.CacheHitRate != 50 ||
+		glm.CacheHitTokens != 100 || glm.CacheMissTokens != 100 {
+		t.Fatalf("same IP/model aggregation=%+v, want 2 req, 50%% cache", glm)
+	}
+	if other := byKey["203.0.113.7\x00claude-4.6"]; other.Requests != 1 || other.PromptTokens != 20 {
+		t.Fatalf("same IP other model=%+v", other)
+	}
+	if other := byKey["198.51.100.9\x00glm-5.3"]; other.Requests != 1 || other.CacheHitRate != 80 {
+		t.Fatalf("other IP same model=%+v", other)
+	}
+}
+
+// Rollup 与落盘都必须保留 IP 维度，不能折叠回没有来源的桶。
+func TestIPModelSurvivesRollupAndPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	r := New(path)
+	old := time.Now().AddDate(0, 0, -100)
+	r.Add(old, "cn", "u", "m", Delta{
+		ClientIP: "203.0.113.7", PromptTokens: 100, HasPromptTokens: true,
+		HasCacheTokens: true, CacheHitTokens: 75, CacheMissTokens: 25,
+	}, true)
+	r.Rollup(time.Now())
+	r.Save()
+
+	r2 := New(path)
+	s := r2.Snapshot(0, nil)
+	if len(s.ByIPModel) != 1 || s.ByIPModel[0].IP != "203.0.113.7" ||
+		s.ByIPModel[0].CacheHitRate != 75 {
+		t.Fatalf("rollup/persist by_ip_model=%+v, want IP and 75%% cache preserved", s.ByIPModel)
+	}
+}
+
+// v4 文件没有 IP 字段：仍可加载，来源显示为空串，不能伪造来源。
+func TestLoadLegacyV4WithoutIP(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage.json")
+	legacy := `{"version":4,"saved":"2026-10-01T00:00:00+08:00","buckets":[{"s":"h:2026-10-01T10","r":"cn","u":"u1","m":"glm-5.3","q":1,"p":42,"t":42,"ch":30,"cm":12}]}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s := New(path).Snapshot(0, nil)
+	if len(s.ByIPModel) != 1 || s.ByIPModel[0].IP != "" ||
+		s.ByIPModel[0].CacheHitRate != 30.0/42.0*100 {
+		t.Fatalf("legacy by_ip_model=%+v, want empty IP and preserved cache rate", s.ByIPModel)
 	}
 }

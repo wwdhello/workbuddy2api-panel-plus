@@ -303,6 +303,53 @@ func TestChatRecordsCreditForStreamAndSync(t *testing.T) {
 	}
 }
 
+// 用量页按来源统计必须与请求日志共用 logging.request_client_info 开关：
+// 开启时反代头优先、直连回落 RemoteAddr；关闭时不得采集 IP。
+func TestChatUsageRecordsClientIPByPrivacySwitch(t *testing.T) {
+	const sseCache = "data: {\"id\":\"chatcmpl-cache\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"total_tokens\":12,\"prompt_cache_hit_tokens\":8,\"prompt_cache_miss_tokens\":2}}\n\n" +
+		"data: [DONE]\n\n"
+	cases := []struct {
+		name    string
+		enabled bool
+		xff     string
+		remote  string
+		wantIP  string
+	}{
+		{name: "forwarded", enabled: true, xff: "203.0.113.7, 10.0.0.1", remote: "127.0.0.1:1234", wantIP: "203.0.113.7"},
+		{name: "direct", enabled: true, remote: "198.51.100.9:4321", wantIP: "198.51.100.9"},
+		{name: "privacy off", enabled: false, xff: "203.0.113.7", remote: "198.51.100.9:4321", wantIP: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseCache, true })
+			rec := usage.New("")
+			h := NewHandler(Config{
+				Pool:             testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+				Upstream:         up,
+				Usage:            rec,
+				RecordClientInfo: tc.enabled,
+			})
+			req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+			req.RemoteAddr = tc.remote
+			if tc.xff != "" {
+				req.Header.Set("X-Forwarded-For", tc.xff)
+			}
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+			if rr.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", rr.Code, rr.Body)
+			}
+			s := rec.Snapshot(24, nil)
+			if len(s.ByIPModel) != 1 || s.ByIPModel[0].IP != tc.wantIP {
+				t.Fatalf("by_ip_model=%+v, want ip=%q", s.ByIPModel, tc.wantIP)
+			}
+			if s.ByIPModel[0].CacheHitRate != 80 {
+				t.Fatalf("cache_hit_rate=%v, want 80", s.ByIPModel[0].CacheHitRate)
+			}
+		})
+	}
+}
+
 func TestChatRotatesOnHardCredit(t *testing.T) {
 	calls := map[string]int{}
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {

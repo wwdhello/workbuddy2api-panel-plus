@@ -174,6 +174,68 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// IP × 模型表：已知 IP、模型、缓存命中率必须渲染；空 IP 只能显示未知来源，
+// 不能把历史桶伪装成某个真实地址。
+func TestAppJSUsageIPModelTable(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; IP model table test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const fmtStart = src.indexOf('function fmtTok(');
+const mixStart = src.indexOf('function usMixBar');
+const mixEnd = src.indexOf('function usPct', mixStart);
+const cacheStart = src.indexOf('function cacheRateCell');
+const cacheEnd = src.indexOf('function renderCreditDim', cacheStart);
+const renderStart = src.indexOf('function renderUsageIPModel');
+const renderEnd = src.indexOf('function usCreditHead', renderStart);
+if ([escStart, escEnd, fmtStart, mixStart, mixEnd, cacheStart, cacheEnd, renderStart, renderEnd].some(v => v < 0)) throw new Error('IP model helpers not found');
+const host = { innerHTML: '', textContent: '' };
+const ctx = {
+  Number, String, Math, RegExp, isNaN, Array, Object, Map,
+  $: id => host,
+  usageData: {
+    by_ip_model: [
+      { ip: '203.0.113.7', model: 'glm-5.3', requests: 2, errors: 0, prompt_tokens: 200,
+        completion_tokens: 20, total_tokens: 220, cache_hit_tokens: 150, cache_miss_tokens: 50 },
+      { ip: '', model: 'claude-4.6', requests: 1, prompt_tokens: 10, total_tokens: 10 },
+    ],
+  },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(escStart, escEnd) + src.slice(fmtStart, src.indexOf('function usStat', fmtStart)) +
+  src.slice(mixStart, mixEnd) + src.slice(cacheStart, cacheEnd) +
+  src.slice(renderStart, renderEnd) + '\nthis.render=renderUsageIPModel;', ctx);
+ctx.render();
+process.stdout.write(JSON.stringify({
+  hasIP: host.innerHTML.includes('203.0.113.7'),
+  hasModel: host.innerHTML.includes('glm-5.3'),
+  hasRate: host.innerHTML.includes('title="命中 150 / 未命中 50 tok">75%</span>'),
+  hasUnknown: host.innerHTML.includes('未知来源'),
+  note: host.textContent,
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "usage-ip-model-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("IP model table node test failed: %v\n%s", err, out)
+	}
+	const want = `{"hasIP":true,"hasModel":true,"hasRate":true,"hasUnknown":true,"note":"2 个来源/模型组合 · 1 个已知来源"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("IP model table=%s\nwant %s", out, want)
+	}
+}
+
 // 模型限流时间必须同时支持上游 reset_at、网关 until 和无重置时间三种形态。
 func TestAppJSRateLimitMeta(t *testing.T) {
 	node, err := exec.LookPath("node")

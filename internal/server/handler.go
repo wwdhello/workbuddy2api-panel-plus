@@ -593,6 +593,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 来源在 ServeHTTP 入口采集（此时才知道开关与请求头），此处转交给统计对象，
 		// 让 stdout 流水行与归档事件共用同一份来源值，两处不会漂移。
 		st.clientIP, st.userAgent = tr.clientIP, tr.userAgent
+	} else if h.loadLive().RecordClientInfo {
+		// RequestLog 未启用时也允许用量页按来源统计；采集开关与请求日志共用，
+		// 关闭后不读取客户端地址。直连场景回落 RemoteAddr，反代场景优先代理头。
+		st.clientIP = clientIPForLog(r)
 	}
 	defer st.done()
 
@@ -715,6 +719,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				CacheHitTokens:   st.cacheHit,
 				CacheMissTokens:  st.cacheMiss,
 				ModelRate:        modelRate,
+				ClientIP:         st.clientIP,
 				LatencyMs:        delta.LatencyMs,
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,

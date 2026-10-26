@@ -3,7 +3,7 @@
 // 与 internal/pool 的 TokenUsage 的区别：
 //   - pool 的 TokenUsage 是**每账号一个累计计数器**，只保留总量与「最近一次」，
 //     没有时间维度，也无法按模型/时间下钻；
-//   - 本包按 (时间片, realm, uid, model, rate) 分桶累计，因此可以出「今天各模型各用了多少」
+//   - 本包按 (时间片, realm, uid, model, rate, client IP) 分桶累计，因此可以出「今天各模型各用了多少」
 //     「这一小时 prompt 涨得多快」这类问题，且能长期保留。
 //
 // 保留策略（分片粒度自动降级，总量因此有界）：
@@ -11,7 +11,7 @@
 //   - 更早：折叠为日桶，**永久保留**（看长期趋势）
 //
 // 落盘：data/usage.json，原子替换 + 防抖刷新（默认 30s），重启不丢。
-// 桶数上界 ≈ 账号数 × 模型数 × (hourlyKeep + 已过天数)，实测单桶约 90 字节。
+// 桶数上界 ≈ 账号数 × 模型数 × 来源 IP 数 × (hourlyKeep + 已过天数)。
 package usage
 
 import (
@@ -42,11 +42,12 @@ const (
 )
 
 // fileVersion 是 usage.json 的当前格式版本。版本 2 增加积分观测字段，版本 3
-// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计；
+// 增加模型生效倍率分区，版本 4 增加前缀缓存命中/未命中累计，版本 5 增加来源 IP
+// 维度；
 // 旧版本缺失字段按零值加载，旧数据不会丢弃。
-const fileVersion = 4
+const fileVersion = 5
 
-// bucket 一个 (时间片, realm, uid, model, rate) 的累计量。
+// bucket 一个 (时间片, realm, uid, model, rate, client IP) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
 	Scope string  `json:"s"`            // "h:2006-01-02T15" 或 "d:2006-01-02"
@@ -54,6 +55,7 @@ type bucket struct {
 	UID   string  `json:"u"`            // 账号 uid
 	Model string  `json:"m"`            // 上游裸模型名
 	Rate  string  `json:"x,omitempty"`  // 请求时生效积分倍率（规范化数值；旧桶为空）
+	IP    string  `json:"i,omitempty"`  // 客户端 IP（隐私开关关闭或旧桶为空）
 	Req   int64   `json:"q"`            // 请求数（含失败）
 	Err   int64   `json:"e"`            // 失败数
 	PT    int64   `json:"p"`            // prompt tokens
@@ -70,6 +72,12 @@ type bucket struct {
 	CM    int64   `json:"cm,omitempty"` // 前缀缓存未命中 token 累计
 }
 
+// bucketKey 集中生成内存桶键。使用 NUL 分隔各维度，避免模型名或来源值里的
+// 常见分隔符（如 "|"）把两个不同维度拼成同一个键。键只用于内存索引，不落盘。
+func bucketKey(scope, realm, uid, model, rate, ip string) string {
+	return strings.Join([]string{scope, realm, uid, model, rate, ip}, "\x00")
+}
+
 // file 落盘结构。
 type file struct {
 	Version int      `json:"version"`
@@ -81,7 +89,7 @@ type file struct {
 type Recorder struct {
 	mu      sync.Mutex
 	path    string
-	buckets map[string]*bucket // key: scope|realm|uid|model|rate
+	buckets map[string]*bucket // key: scope|realm|uid|model|rate|ip
 	dirty   bool
 	started time.Time
 
@@ -148,14 +156,17 @@ type Delta struct {
 	Credit           float64
 	HasCredit        bool
 	ModelRate        string
+	// ClientIP 是请求来源 IP。是否采集由 handler 的
+	// logging.request_client_info 决定；空串表示未采集或历史数据。
+	ClientIP string
 	// CacheHitTokens / CacheMissTokens 前缀缓存命中/未命中观测（issue #92）。
-	HasCacheTokens   bool
-	CacheHitTokens   int64
-	CacheMissTokens  int64
-	LatencyMs        int64
-	HasLatency       bool
-	TokensPerSecond  float64
-	HasTPS           bool
+	HasCacheTokens  bool
+	CacheHitTokens  int64
+	CacheMissTokens int64
+	LatencyMs       int64
+	HasLatency      bool
+	TokensPerSecond float64
+	HasTPS          bool
 }
 
 // Add 记录一次请求尝试。
@@ -173,14 +184,14 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 		model = "(unknown)"
 	}
 	scope := "h:" + now.Format(hourLayout)
-	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + d.ModelRate
+	key := bucketKey(scope, realm, uid, model, d.ModelRate, d.ClientIP)
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	b := r.buckets[key]
 	if b == nil {
-		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate}
+		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, Rate: d.ModelRate, IP: d.ClientIP}
 		r.buckets[key] = b
 	}
 	b.Req++
@@ -247,7 +258,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			continue
 		}
 		day := "d:" + ts.Format(dayLayout)
-		moves = append(moves, move{from: k, to: day + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.Rate})
+		moves = append(moves, move{from: k, to: bucketKey(day, b.Realm, b.UID, b.Model, b.Rate, b.IP)})
 	}
 	for _, m := range moves {
 		src := r.buckets[m.from]
@@ -257,7 +268,7 @@ func (r *Recorder) Rollup(now time.Time) {
 		dst := r.buckets[m.to]
 		if dst == nil {
 			cp := *src
-			cp.Scope = strings.SplitN(m.to, "|", 2)[0]
+			cp.Scope = strings.SplitN(m.to, "\x00", 2)[0]
 			dst = &cp
 			r.buckets[m.to] = dst
 		} else {
@@ -300,7 +311,7 @@ func (r *Recorder) load() error {
 	}
 	for i := range f.Buckets {
 		b := f.Buckets[i]
-		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model+"|"+b.Rate] = &b
+		r.buckets[bucketKey(b.Scope, b.Realm, b.UID, b.Model, b.Rate, b.IP)] = &b
 	}
 	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
 	return nil
@@ -416,6 +427,15 @@ type KeyedAgg struct {
 	Agg
 }
 
+// IPModelAgg 按「客户端 IP × 模型」聚合的一行。IP 为空表示历史桶未记录来源，
+// 或当前关闭了 logging.request_client_info；前端会把它标为未知来源，不能归到
+// 任何真实 IP 上。
+type IPModelAgg struct {
+	IP    string `json:"ip"`
+	Model string `json:"model"`
+	Agg
+}
+
 // Point 时序上的一个点。
 type Point struct {
 	T     string `json:"t"`
@@ -466,16 +486,17 @@ func (a *creditAcc) finish() CreditAgg {
 
 // Snapshot 面板一次拉取的全部用量视图数据。
 type Snapshot struct {
-	Totals          Agg         `json:"totals"`
-	ByRealm         []KeyedAgg  `json:"by_realm"`
-	ByAccount       []KeyedAgg  `json:"by_account"`
-	ByModel         []KeyedAgg  `json:"by_model"`
-	Series          []Point     `json:"series"`
-	CreditByAccount []CreditAgg `json:"credit_by_account"`
-	CreditByModel   []CreditAgg `json:"credit_by_model"`
-	Buckets         int         `json:"buckets"`
-	FileBytes       int64       `json:"file_bytes"`
-	Since           string      `json:"since,omitempty"`
+	Totals          Agg          `json:"totals"`
+	ByRealm         []KeyedAgg   `json:"by_realm"`
+	ByAccount       []KeyedAgg   `json:"by_account"`
+	ByModel         []KeyedAgg   `json:"by_model"`
+	ByIPModel       []IPModelAgg `json:"by_ip_model"`
+	Series          []Point      `json:"series"`
+	CreditByAccount []CreditAgg  `json:"credit_by_account"`
+	CreditByModel   []CreditAgg  `json:"credit_by_model"`
+	Buckets         int          `json:"buckets"`
+	FileBytes       int64        `json:"file_bytes"`
+	Since           string       `json:"since,omitempty"`
 	// WindowFrom/WindowTo 本次实际生效的统计区间（本地时间，RFC3339），供面板
 	// 回显口径——「自定义」区间下用户必须能确认服务端到底按哪段算的。
 	// 空串 = 该侧不设界（全部历史 / 到今天为止）。
@@ -570,6 +591,8 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 	acctAgg := map[string]*aggAcc{}
 	acctRealm := map[string]string{}
 	modelAgg := map[string]*aggAcc{}
+	ipModelAgg := map[string]*aggAcc{}
+	ipModelMeta := map[string]IPModelAgg{}
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
 	creditAcctAgg := map[string]*creditAcc{}
@@ -620,6 +643,16 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 			modelAgg[b.Model] = &aggAcc{}
 		}
 		modelAgg[b.Model].add(b)
+
+		// IP × 模型不区分账号与 realm：同一来源在多个账号间轮转时仍应合并，
+		// 这样缓存命中率反映的是该来源对同一模型的实际复用效果。
+		model := canonicalUsageModel(b.Model)
+		ipModelKey := b.IP + "\x00" + model
+		if ipModelAgg[ipModelKey] == nil {
+			ipModelAgg[ipModelKey] = &aggAcc{}
+			ipModelMeta[ipModelKey] = IPModelAgg{IP: b.IP, Model: model}
+		}
+		ipModelAgg[ipModelKey].add(b)
 
 		if strings.HasPrefix(b.Scope, "h:") {
 			scope := strings.TrimPrefix(b.Scope, "h:")
@@ -676,6 +709,7 @@ func (r *Recorder) SnapshotWindow(w Window, nicks map[string]string, currentRate
 			return k, nicks[k]
 		}),
 		ByModel:         keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		ByIPModel:       ipModelKeyed(ipModelAgg, ipModelMeta),
 		CreditByAccount: creditKeyed(creditAcctAgg),
 		CreditByModel:   creditKeyed(creditModelAgg),
 		Buckets:         matched,
@@ -773,6 +807,28 @@ func keyed(m map[string]*aggAcc, label func(string) (string, string)) []KeyedAgg
 			return out[i].Requests > out[j].Requests
 		}
 		return out[i].Key < out[j].Key
+	})
+	return out
+}
+
+func ipModelKeyed(aggs map[string]*aggAcc, meta map[string]IPModelAgg) []IPModelAgg {
+	out := make([]IPModelAgg, 0, len(aggs))
+	for key, acc := range aggs {
+		row := meta[key]
+		row.Agg = acc.finish()
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TotalTokens != out[j].TotalTokens {
+			return out[i].TotalTokens > out[j].TotalTokens
+		}
+		if out[i].Requests != out[j].Requests {
+			return out[i].Requests > out[j].Requests
+		}
+		if out[i].IP != out[j].IP {
+			return out[i].IP < out[j].IP
+		}
+		return out[i].Model < out[j].Model
 	})
 	return out
 }

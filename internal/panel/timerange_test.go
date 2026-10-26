@@ -80,6 +80,13 @@ func TestUsageHandlerAcceptsExplicitRange(t *testing.T) {
 	if got["window_from"] == nil || got["window_to"] == nil {
 		t.Fatalf("响应应回显 window_from/window_to: %+v", got)
 	}
+	ipRows, ok := got["by_ip_model"].([]any)
+	if !ok || len(ipRows) != 1 {
+		t.Fatalf("by_ip_model = %#v, want one windowed row", got["by_ip_model"])
+	}
+	if n := ipRows[0].(map[string]any)["requests"].(float64); n != 2 {
+		t.Fatalf("by_ip_model requests = %v, want 2（时间窗口必须作用于来源表）", n)
+	}
 
 	// 无区间参数时回落默认 72h，且不回显区间。
 	def := get("")

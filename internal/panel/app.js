@@ -1943,6 +1943,39 @@ function renderUsageDim() {
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
 
+/* IP × 模型：用量与前缀缓存命中率放在同一行，便于定位某个来源对某个模型的
+   缓存复用情况。空 IP 只可能来自历史桶或关闭来源采集，不能伪装成真实来源。 */
+function renderUsageIPModel() {
+  const rows = (usageData && usageData.by_ip_model) || [];
+  const sorted = rows.slice().sort((a, b) => {
+    const at = Number(a.total_tokens || 0), bt = Number(b.total_tokens || 0);
+    if (at !== bt) return bt - at;
+    return String(a.ip || '').localeCompare(String(b.ip || '')) ||
+      String(a.model || '').localeCompare(String(b.model || ''));
+  });
+  $('usIPModelBody').innerHTML = sorted.map(row => {
+    const ip = String(row.ip || '').trim();
+    const source = ip
+      ? esc(ip)
+      : '<span class="muted" title="升级前的历史桶未记录 IP，或 logging.request_client_info 已关闭">未知来源</span>';
+    return '<tr>' +
+      '<td class="mark" aria-hidden="true"></td>' +
+      '<td>' + source + '</td>' +
+      '<td>' + esc(row.model || '—') + '</td>' +
+      '<td class="num">' + fmtTok(row.requests) + '</td>' +
+      '<td class="num">' + (row.errors ? '<span style="color:var(--warn)">' + fmtTok(row.errors) + '</span>' : '—') + '</td>' +
+      '<td class="num">' + fmtTok(row.prompt_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(row.completion_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(row.total_tokens) + usMixBar(row.prompt_tokens, row.completion_tokens, row.total_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(row.cache_hit_tokens) + '</td>' +
+      '<td class="num">' + fmtTok(row.cache_miss_tokens) + '</td>' +
+      '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
+    '</tr>';
+  }).join('') || '<tr><td colspan="11" class="empty">暂无按 IP 的用量记录。新请求产生后，这里会按 IP × 模型统计；升级前的历史数据无法回填来源。</td></tr>';
+  const known = sorted.filter(row => String(row.ip || '').trim()).length;
+  $('usIPModelNote').textContent = sorted.length + ' 个来源/模型组合 · ' + known + ' 个已知来源';
+}
+
 /* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
 function usCreditHead(dim) {
   return dim === 'model'
@@ -2062,6 +2095,7 @@ function renderUsage(d) {
     (usageData.credit_by_model || []).length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
 
   renderUsageDim();
+  renderUsageIPModel();
   renderCreditDim();
   renderUsageChart(usageData.series || []);
 }
