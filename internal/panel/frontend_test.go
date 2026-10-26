@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -191,7 +192,7 @@ const mixStart = src.indexOf('function usMixBar');
 const mixEnd = src.indexOf('function usPct', mixStart);
 const cacheStart = src.indexOf('function cacheRateCell');
 const cacheEnd = src.indexOf('function renderCreditDim', cacheStart);
-const renderStart = src.indexOf('function renderUsageIPModel');
+const renderStart = src.indexOf("let usIPQ = '', usIPSize = 50, usIPPage = 1;");
 const renderEnd = src.indexOf('function usCreditHead', renderStart);
 if ([escStart, escEnd, fmtStart, mixStart, mixEnd, cacheStart, cacheEnd, renderStart, renderEnd].some(v => v < 0)) throw new Error('IP model helpers not found');
 const host = { innerHTML: '', textContent: '' };
@@ -233,6 +234,145 @@ process.stdout.write(JSON.stringify({
 	const want = `{"hasIP":true,"hasModel":true,"hasRate":true,"hasUnknown":true,"note":"2 个来源/模型组合 · 1 个已知来源"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("IP model table=%s\nwant %s", out, want)
+	}
+}
+
+// IP × 模型表必须能搜索与分页：多 IP × 多模型时行数会上百，全铺开一页既难找
+// 也把下面的积分历史顶出首屏。这里锁三件事——分页只渲染当前页、页码越界夹回
+// 末页、搜索按空格分词 AND 且能把空 IP 行当「未知来源」搜到。
+func TestAppJSUsageIPModelSearchPaging(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; IP model paging test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const fmtStart = src.indexOf('function fmtTok(');
+const mixStart = src.indexOf('function usMixBar');
+const mixEnd = src.indexOf('function usPct', mixStart);
+const cacheStart = src.indexOf('function cacheRateCell');
+const cacheEnd = src.indexOf('function renderCreditDim', cacheStart);
+const renderStart = src.indexOf("let usIPQ = '', usIPSize = 50, usIPPage = 1;");
+const renderEnd = src.indexOf('function usCreditHead', renderStart);
+if ([escStart, escEnd, fmtStart, mixStart, mixEnd, cacheStart, cacheEnd, renderStart, renderEnd].some(v => v < 0)) throw new Error('IP model helpers not found');
+const body = { innerHTML: '', textContent: '' };
+const pager = { innerHTML: '' };
+const rows = [
+  { ip: '10.0.0.1', model: 'glm-5.3', requests: 9, total_tokens: 900 },
+  { ip: '10.0.0.2', model: 'glm-5.3', requests: 8, total_tokens: 800 },
+  { ip: '10.0.0.3', model: 'claude-4.6', requests: 7, total_tokens: 700 },
+  { ip: '10.0.0.4', model: 'claude-4.6', requests: 6, total_tokens: 600 },
+  { ip: '10.0.0.5', model: 'kimi-k2', requests: 5, total_tokens: 500 },
+  { ip: '', model: 'kimi-k2', requests: 4, total_tokens: 400 },
+];
+const ctx = {
+  Number, String, Math, RegExp, isNaN, Array, Object, Map,
+  $: id => (id === 'usIPPager' ? pager : body),
+  usageData: { by_ip_model: rows },
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(escStart, escEnd) + src.slice(fmtStart, src.indexOf('function usStat', fmtStart)) +
+  src.slice(mixStart, mixEnd) + src.slice(cacheStart, cacheEnd) +
+  src.slice(renderStart, renderEnd) + '\nthis.render=renderUsageIPModel;' +
+  '\nthis.set=function(q,size,page){usIPQ=q;usIPSize=size;usIPPage=page;};' +
+  '\nthis.page=function(){return usIPPage;};', ctx);
+
+const pgText = () => { // 只取页码说明，别把按钮文字混进来
+  const m = pager.innerHTML.match(/<span class="pg">([^<]*)<\/span>/);
+  return m ? m[1] : '';
+};
+const snap = () => ({ body: body.innerHTML, note: body.textContent,
+  pager: pgText(), pagerHtml: pager.innerHTML });
+const out = {};
+ctx.set('', 2, 1); ctx.render();
+out.p1 = snap();
+out.p1Page = ctx.page();
+ctx.render(); // 同一状态重复渲染必须稳定，不能自增页码
+out.p1Again = snap().body;
+ctx.set('', 2, 2); ctx.render();
+out.p2 = snap();
+ctx.set('', 2, 99); ctx.render(); // 越界夹回末页
+out.clamped = snap();
+out.clampedPage = ctx.page();
+ctx.set('glm', 2, 1); ctx.render(); // 空格分词 AND：单词命中两个模型行
+out.glm = snap();
+ctx.set('10.0.0.1 glm', 2, 1); ctx.render(); // 两个词同时命中同一行
+out.both = snap();
+ctx.set('未知', 2, 1); ctx.render(); // 空 IP 行按未知来源参与匹配
+out.unknown = snap();
+ctx.set('zzz', 2, 1); ctx.render(); // 无命中：提示语要说清是没有匹配
+out.empty = snap();
+ctx.set('', 0, 1); ctx.render(); // 全部：不分页，pager 只留区间
+out.all = snap();
+
+process.stdout.write(JSON.stringify({
+  page1Rows: (out.p1.body.match(/<tr>/g) || []).length,
+  page1HasFirst: out.p1.body.includes('10.0.0.1'),
+  page1HasSecond: out.p1.body.includes('10.0.0.2'),
+  page1LacksThird: !out.p1.body.includes('10.0.0.3'),
+  page1Pager: out.p1.pager,
+  stable: out.p1.body === out.p1Again,
+  page2Rows: (out.p2.body.match(/<tr>/g) || []).length,
+  page2HasThird: out.p2.body.includes('10.0.0.3'),
+  page2LacksFifth: !out.p2.body.includes('10.0.0.5'),
+  page2Pager: out.p2.pager,
+  clampedPage: out.clampedPage,
+  clampedHasLast: out.clamped.body.includes('kimi-k2'),
+  glmRows: (out.glm.body.match(/<tr>/g) || []).length,
+  glmNoOther: !out.glm.body.includes('claude-4.6'),
+  bothRows: (out.both.body.match(/<tr>/g) || []).length,
+  unknownHasRow: out.unknown.body.includes('未知来源'),
+  emptyHint: out.empty.body.includes('没有匹配'),
+  allRows: (out.all.body.match(/<tr>/g) || []).length,
+  allPager: out.all.pager,
+  allNoButtons: !out.all.pagerHtml.includes('data-pg'),
+}));`
+
+	f, err := os.CreateTemp(t.TempDir(), "usage-ip-model-paging-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("IP model paging node test failed: %v\n%s", err, out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("decode output %q: %v", out, err)
+	}
+	check := map[string]any{
+		"page1Rows":       float64(2),
+		"page1HasFirst":   true,
+		"page1HasSecond":  true,
+		"page1LacksThird": true,
+		"page1Pager":      "1 / 3 页 · 1–2 / 6 行",
+		"stable":          true,
+		"page2Rows":       float64(2),
+		"page2HasThird":   true,
+		"page2LacksFifth": true,
+		"page2Pager":      "2 / 3 页 · 3–4 / 6 行",
+		"clampedPage":     float64(3),
+		"clampedHasLast":  true,
+		"glmRows":         float64(2),
+		"glmNoOther":      true,
+		"bothRows":        float64(1),
+		"unknownHasRow":   true,
+		"emptyHint":       true,
+		"allRows":         float64(6),
+		"allPager":        "1–6 / 6 行",
+		"allNoButtons":    true,
+	}
+	for k, want := range check {
+		if got[k] != want {
+			t.Errorf("%s = %#v, want %#v (all: %#v)", k, got[k], want, got)
+		}
 	}
 }
 

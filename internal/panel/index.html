@@ -524,6 +524,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .fbar .grow { flex: 1; }
   .fbar .flab { color: var(--ink-3); font-size: 12px; white-space: nowrap; }
   .fbar select { cursor: pointer; }
+  /* IP × 模型表的分页条（同样落在 .fbar 里）：上一页 / 页码 / 下一页与搜索框
+     同行。按钮沿用 button.xs 的紧凑外观，页码用等宽数字，避免翻页时宽度抖动。*/
+  .fbar .pager { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .fbar .pager .pg { color: var(--ink-3); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   /* 用量总览的头部在「自定义」态会多出两个时间输入框：允许换行，宁可整组折到
      下一行，也不要把标题挤成两行、把下拉压成窄条。
      口径说明（#usNote）单行截断而不是折行——它是长文本，一旦允许折行就会在窄屏
@@ -878,6 +882,20 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <span class="note" id="usIPModelNote">—</span>
         </header>
+        <div class="fbar" id="usIPFilter">
+          <input id="usIPQ" type="search" placeholder="搜索 IP / 模型（空格分词，AND）" aria-label="搜索 IP 或模型">
+          <label class="sel-note">每页
+            <select id="usIPSize">
+              <option value="20">20 行</option>
+              <option value="50" selected>50 行</option>
+              <option value="100">100 行</option>
+              <option value="0">全部</option>
+            </select>
+          </label>
+          <span class="grow"></span>
+          <span class="pager" id="usIPPager"></span>
+        </div>
+
         <div class="tbl-wrap">
           <table class="acc zebra">
             <thead>

@@ -1944,16 +1944,78 @@ function renderUsageDim() {
 }
 
 /* IP × 模型：用量与前缀缓存命中率放在同一行，便于定位某个来源对某个模型的
-   缓存复用情况。空 IP 只可能来自历史桶或关闭来源采集，不能伪装成真实来源。 */
-function renderUsageIPModel() {
-  const rows = (usageData && usageData.by_ip_model) || [];
-  const sorted = rows.slice().sort((a, b) => {
+   缓存复用情况。空 IP 只可能来自历史桶或关闭来源采集，不能伪装成真实来源。
+
+   行数 = 来源数 × 模型数，多 IP + 多模型时很容易上百行，全铺开会把下面的
+   积分历史挤出首屏，所以这张表自带搜索与分页。数据整份已在内存（同一份
+   by_ip_model），筛选与翻页纯前端完成：不额外打后端，也不改变统计口径。*/
+let usIPQ = '', usIPSize = 50, usIPPage = 1;
+
+/* usIPMatch 空格分词 AND 匹配 IP 与模型两个字段（与请求记录搜索同一习惯）。
+   空 IP 行按「未知来源」参与匹配：历史桶或关闭采集时它是唯一可展示的名字，
+   用户搜「未知」应该能找到这些行，而不是以为数据丢了。*/
+function usIPMatch(row, q) {
+  const terms = String(q || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const ip = String((row && row.ip) || '').trim();
+  const hay = (ip || '未知来源').toLowerCase() + ' ' + String((row && row.model) || '').toLowerCase();
+  return terms.every(t => hay.includes(t));
+}
+
+function usIPFilterRows(rows, q) {
+  return (rows || []).filter(row => usIPMatch(row, q));
+}
+
+/* usIPSortRows 合计 Token 降序（最大的来源最值得先看），同分按 IP / 模型
+   兜底排序，保证翻页时行序稳定、不会来回跳。*/
+function usIPSortRows(rows) {
+  return (rows || []).slice().sort((a, b) => {
     const at = Number(a.total_tokens || 0), bt = Number(b.total_tokens || 0);
     if (at !== bt) return bt - at;
     return String(a.ip || '').localeCompare(String(b.ip || '')) ||
       String(a.model || '').localeCompare(String(b.model || ''));
   });
-  $('usIPModelBody').innerHTML = sorted.map(row => {
+}
+
+/* usIPPageWindow 把「总行数 / 每页行数 / 当前页」折算成安全的分页窗口。
+   页码越界（搜索后行数变少、后台刷新后数据变少）一律夹回最后一页，调用方
+   不必先算一遍页数；size<=0 表示全部显示、恒为第 1 页。*/
+function usIPPageWindow(total, size, page) {
+  const n = Math.max(0, Number(total) || 0);
+  const raw = Number(size);
+  const per = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0;
+  const pages = per > 0 ? Math.max(1, Math.ceil(n / per)) : 1;
+  let cur = Math.floor(Number(page) || 1);
+  if (!Number.isFinite(cur) || cur < 1) cur = 1;
+  if (cur > pages) cur = pages;
+  const from = per > 0 ? (cur - 1) * per : 0;
+  const to = per > 0 ? Math.min(n, from + per) : n;
+  return { page: cur, pages: pages, per: per, from: from, to: to };
+}
+
+/* usIPPagerHtml 分页条：上一页 / 页码 / 下一页 + 当前区间。
+   「全部」模式下只留区间文字——此时翻页按钮没有意义。*/
+function usIPPagerHtml(win, total) {
+  const n = Math.max(0, Number(total) || 0);
+  const range = n ? (win.from + 1) + '–' + win.to + ' / ' + n + ' 行' : '0 行';
+  if (!win.per) return '<span class="pg">' + range + '</span>';
+  return '<button class="xs" data-pg="prev"' + (win.page <= 1 ? ' disabled' : '') +
+      ' title="上一页">上一页</button>' +
+    '<span class="pg">' + win.page + ' / ' + win.pages + ' 页 · ' + range + '</span>' +
+    '<button class="xs" data-pg="next"' + (win.page >= win.pages ? ' disabled' : '') +
+      ' title="下一页">下一页</button>';
+}
+
+function renderUsageIPModel() {
+  const all = (usageData && usageData.by_ip_model) || [];
+  const matched = usIPSortRows(usIPFilterRows(all, usIPQ));
+  const win = usIPPageWindow(matched.length, usIPSize, usIPPage);
+  usIPPage = win.page; // 夹回后的页码写回状态，下次翻页从真实位置继续
+  const rows = matched.slice(win.from, win.to);
+  // 先 pager 后 body：真实 DOM 上两者互不影响，但前端测试桩把 $ 的所有 id
+  // 都指向同一个对象，只有这个顺序能保证断言读到的是表格行。
+  if ($('usIPPager')) $('usIPPager').innerHTML = usIPPagerHtml(win, matched.length);
+  $('usIPModelBody').innerHTML = rows.map(row => {
     const ip = String(row.ip || '').trim();
     const source = ip
       ? esc(ip)
@@ -1971,9 +2033,11 @@ function renderUsageIPModel() {
       '<td class="num">' + fmtTok(row.cache_miss_tokens) + '</td>' +
       '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
     '</tr>';
-  }).join('') || '<tr><td colspan="11" class="empty">暂无按 IP 的用量记录。新请求产生后，这里会按 IP × 模型统计；升级前的历史数据无法回填来源。</td></tr>';
-  const known = sorted.filter(row => String(row.ip || '').trim()).length;
-  $('usIPModelNote').textContent = sorted.length + ' 个来源/模型组合 · ' + known + ' 个已知来源';
+  }).join('') || (all.length
+    ? '<tr><td colspan="11" class="empty">没有匹配「' + esc(usIPQ) + '」的 IP 或模型。</td></tr>'
+    : '<tr><td colspan="11" class="empty">暂无按 IP 的用量记录。新请求产生后，这里会按 IP × 模型统计；升级前的历史数据无法回填来源。</td></tr>');
+  const known = all.filter(row => String(row.ip || '').trim()).length;
+  $('usIPModelNote').textContent = all.length + ' 个来源/模型组合 · ' + known + ' 个已知来源';
 }
 
 /* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
@@ -2117,6 +2181,33 @@ if ($('usSort')) $('usSort').onchange = () => {
   usSort = $('usSort').value;
   renderUsageDim();
 };
+
+/* IP × 模型表的搜索与分页。搜索防抖 150ms（与请求记录一致）：每键重排
+   上百行没必要，还会让输入发卡。改搜索词或每页行数都回到第 1 页，否则
+   用户会停在一个已经不存在的页码上。*/
+let usIPQTimer = null;
+if ($('usIPQ')) $('usIPQ').oninput = () => {
+  clearTimeout(usIPQTimer);
+  usIPQTimer = setTimeout(() => {
+    usIPQ = $('usIPQ').value.trim();
+    usIPPage = 1;
+    renderUsageIPModel();
+  }, 150);
+};
+if ($('usIPSize')) $('usIPSize').onchange = () => {
+  usIPSize = Number($('usIPSize').value);
+  if (!Number.isFinite(usIPSize) || usIPSize < 0) usIPSize = 0;
+  usIPPage = 1;
+  renderUsageIPModel();
+};
+/* 分页按钮每次渲染都会重建，监听挂在容器上做事件委托（与维度切换同一手法），
+   否则每翻一页都要重新绑一次。*/
+if ($('usIPPager')) $('usIPPager').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-pg]');
+  if (!b || b.disabled) return;
+  usIPPage += b.dataset.pg === 'prev' ? -1 : 1;
+  renderUsageIPModel();
+});
 
 /* renderUsageChart 画堆叠柱状图。
  *
